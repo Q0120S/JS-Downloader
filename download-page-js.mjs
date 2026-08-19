@@ -724,14 +724,15 @@ async function writePrettifiedFiles() {
     if (source == null) continue;
 
     const relative = path.relative(outRoot, file.localPath);
+    const sourceBytes = Buffer.byteLength(source, "utf8");
     const usePrettier =
       prettier &&
       prettyEngine !== "basic" &&
-      (prettyEngine === "prettier" || Buffer.byteLength(source, "utf8") <= prettyMaxBytes);
+      (prettyEngine === "prettier" || sourceBytes <= prettyMaxBytes);
 
     console.log(
       `  prettifying [${i + 1}/${jsFiles.length}] ${relative} (${formatBytes(
-        Buffer.byteLength(source, "utf8"),
+        sourceBytes,
       )}, ${usePrettier ? "prettier" : "basic"})`,
     );
 
@@ -787,13 +788,53 @@ function formatBytes(value) {
 }
 
 function basicJavaScriptPrettify(source) {
-  let output = "";
+  const parts = [];
+  const indentCache = [""];
   let indent = 0;
   let quote = null;
   let escaped = false;
+  let lineStart = true;
+  let pendingSpace = false;
+  let consecutiveNewlines = 0;
+
+  const currentIndent = () => {
+    const safeIndent = Math.max(indent, 0);
+    if (!indentCache[safeIndent]) {
+      indentCache[safeIndent] = "  ".repeat(safeIndent);
+    }
+    return indentCache[safeIndent];
+  };
 
   const writeIndent = () => {
-    output += "  ".repeat(Math.max(indent, 0));
+    if (!lineStart) return;
+    const value = currentIndent();
+    if (value) parts.push(value);
+    lineStart = false;
+  };
+
+  const writeToken = (value) => {
+    if (!value) return;
+    if (lineStart) {
+      writeIndent();
+    } else if (pendingSpace) {
+      parts.push(" ");
+    }
+    parts.push(value);
+    lineStart = false;
+    pendingSpace = false;
+    consecutiveNewlines = 0;
+  };
+
+  const writeNewline = () => {
+    pendingSpace = false;
+    if (lineStart) {
+      if (consecutiveNewlines >= 2) return;
+    } else {
+      lineStart = true;
+    }
+    parts.push("\n");
+    lineStart = true;
+    consecutiveNewlines += 1;
   };
 
   for (let i = 0; i < source.length; i += 1) {
@@ -801,7 +842,7 @@ function basicJavaScriptPrettify(source) {
     const next = source[i + 1];
 
     if (quote) {
-      output += char;
+      writeToken(char);
       if (escaped) {
         escaped = false;
       } else if (char === "\\") {
@@ -814,50 +855,42 @@ function basicJavaScriptPrettify(source) {
 
     if (char === "\"" || char === "'" || char === "`") {
       quote = char;
-      output += char;
+      writeToken(char);
       continue;
     }
 
     if (char === "{" || char === "[" || char === "(") {
-      output += `${char}\n`;
+      writeToken(char);
       indent += 1;
-      writeIndent();
+      writeNewline();
       continue;
     }
 
     if (char === "}" || char === "]" || char === ")") {
-      output = output.replace(/[ \t]+$/g, "");
-      if (!output.endsWith("\n")) output += "\n";
+      if (!lineStart) writeNewline();
       indent -= 1;
-      writeIndent();
-      output += char;
+      writeToken(char);
       if (next !== ";" && next !== "," && next !== "." && next !== ")" && next !== "]") {
-        output += "\n";
-        writeIndent();
+        writeNewline();
       }
       continue;
     }
 
     if (char === ";" || char === ",") {
-      output += `${char}\n`;
-      writeIndent();
+      writeToken(char);
+      writeNewline();
       continue;
     }
 
     if (/\s/.test(char)) {
-      if (!/[ \n]$/.test(output)) output += " ";
+      if (!lineStart) pendingSpace = true;
       continue;
     }
 
-    output += char;
+    writeToken(char);
   }
 
-  return output
-    .split("\n")
-    .map((line) => line.trimEnd())
-    .join("\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trimStart();
+  return parts.join("");
 }
 
 async function downloadDirect(activeContext, url, source) {
