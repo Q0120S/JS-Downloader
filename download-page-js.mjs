@@ -6,44 +6,77 @@ import crypto from "node:crypto";
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
-let chromium;
 
-try {
-  ({ chromium } = require("playwright"));
-} catch {
-  console.error(
-    "Missing dependency: playwright\n\nInstall it with:\n  npm install playwright\n  npx playwright install chromium\n",
-  );
-  process.exit(1);
-}
+const SHORT_FLAGS = {
+  h: "help",
+  x: "proxy",
+  H: "header",
+  o: "out",
+  r: "routes",
+  d: "depth",
+  w: "wait",
+  t: "timeout",
+  g: "headful",
+  p: "pretty",
+  e: "pretty-engine",
+  b: "pretty-max-bytes",
+  m: "max-lazy-chunks",
+  l: "no-lazy-chunks",
+  s: "include-sourcemaps",
+  R: "recover-sources",
+};
 
 const args = parseArgs(process.argv.slice(2));
 
-if (!args.url) {
-  console.error(`
+let chromium;
+
+if (!args.help) {
+  try {
+    ({ chromium } = require("playwright"));
+  } catch {
+    console.error(
+      "Missing dependency: playwright\n\nInstall it with:\n  npm install playwright\n  npx playwright install chromium\n",
+    );
+    process.exit(1);
+  }
+}
+
+const usageText = `
 Usage:
   node download-page-js.mjs <url> [options]
 
 Options:
-  --out <dir>              Output directory. Default: ./downloaded-js
-  --routes <n>             Visit up to n same-origin links to trigger SPA chunks. Default: 25
-  --depth <n>              Same-origin route crawl depth. Default: 1
-  --wait <ms>              Extra wait after each page load. Default: 1500
-  --headful                Show browser window
-  --no-lazy-chunks         Skip static webpack/Vite lazy chunk discovery
-  --max-lazy-chunks <n>    Max lazy chunk URLs to download. Default: 1000
-  --include-sourcemaps     Also download source maps referenced by JS files
-  --pretty                 Save formatted JS copies under <out>/__pretty
-  --pretty-engine <mode>   auto, basic, or prettier. Default: auto
-  --pretty-max-bytes <n>   Max file size for Prettier in auto mode. Default: 750000
-  --recover-sources        Extract original sources from source maps under <out>/__sources
-  --timeout <ms>           Page/navigation timeout. Default: 45000
+  -h, --help                 Show this help and exit
+  -x, --proxy <url>          Proxy server for browser and downloads (e.g. http://host:port)
+  -H, --header <"K: V">      Extra HTTP header, repeatable (e.g. -H "Authorization: Bearer x")
+  -o, --out <dir>            Output directory. Default: ./downloaded-js
+  -r, --routes <n>           Visit up to n same-origin links to trigger SPA chunks. Default: 25
+  -d, --depth <n>            Same-origin route crawl depth. Default: 1
+  -w, --wait <ms>            Extra wait after each page load. Default: 1500
+  -g, --headful              Show browser window
+  -l, --no-lazy-chunks       Skip static webpack/Vite lazy chunk discovery
+  -m, --max-lazy-chunks <n>  Max lazy chunk URLs to download. Default: 1000
+  -s, --include-sourcemaps   Also download source maps referenced by JS files
+  -p, --pretty               Save formatted JS copies under <out>/__pretty
+  -e, --pretty-engine <mode> auto, basic, or prettier. Default: auto
+  -b, --pretty-max-bytes <n> Max file size for Prettier in auto mode. Default: 750000
+  -R, --recover-sources      Extract original sources from source maps under <out>/__sources
+  -t, --timeout <ms>         Page/navigation timeout. Default: 45000
 
 Examples:
   node download-page-js.mjs https://example.com
   node download-page-js.mjs https://example.com --out ./js --routes 80 --depth 2
   node download-page-js.mjs https://example.com --pretty --recover-sources
-`);
+  node download-page-js.mjs https://example.com -x http://127.0.0.1:8080 -H "Cookie: a=b"
+`;
+
+if (args.help) {
+  console.error(usageText);
+  process.exit(0);
+}
+
+if (!args.url) {
+  console.error(usageText);
   process.exit(1);
 }
 
@@ -55,18 +88,28 @@ const maxDepth = Number(args.depth ?? 1);
 const waitMs = Number(args.wait ?? 1500);
 const timeoutMs = Number(args.timeout ?? 45000);
 const pretty = Boolean(args.pretty || args.prettify || args.beautify);
-const prettyEngine = String(args["pretty-engine"] ?? args.prettyEngine ?? "auto").toLowerCase();
-const prettyMaxBytes = Number(args["pretty-max-bytes"] ?? args.prettyMaxBytes ?? 750_000);
+const prettyEngine = String(
+  args["pretty-engine"] ?? args.prettyEngine ?? "auto",
+).toLowerCase();
+const prettyMaxBytes = Number(
+  args["pretty-max-bytes"] ?? args.prettyMaxBytes ?? 750_000,
+);
 const lazyChunks = !Boolean(args["no-lazy-chunks"] || args.noLazyChunks);
-const maxLazyChunks = Number(args["max-lazy-chunks"] ?? args.maxLazyChunks ?? 1000);
+const maxLazyChunks = Number(
+  args["max-lazy-chunks"] ?? args.maxLazyChunks ?? 1000,
+);
 const recoverSources = Boolean(
   args["recover-sources"] ||
-    args.recoverSources ||
-    args["extract-sources"] ||
-    args.extractSources ||
-    args.sources,
+  args.recoverSources ||
+  args["extract-sources"] ||
+  args.extractSources ||
+  args.sources,
 );
-const includeSourcemaps = Boolean(args.includeSourcemaps || args["include-sourcemaps"] || recoverSources);
+const includeSourcemaps = Boolean(
+  args.includeSourcemaps || args["include-sourcemaps"] || recoverSources,
+);
+const proxyServer = args.proxy;
+const customHeaders = parseHeaders(args.header);
 
 const downloaded = new Map();
 const seenRoutes = new Set();
@@ -85,6 +128,10 @@ const context = await browser.newContext({
 
 context.setDefaultTimeout(timeoutMs);
 context.setDefaultNavigationTimeout(timeoutMs);
+
+if (customHeaders) {
+  await context.setExtraHTTPHeaders(customHeaders);
+}
 
 const page = await context.newPage();
 
@@ -132,7 +179,10 @@ while (queuedRoutes.length && routeVisits < maxRoutes) {
     const links = await discoverSameOriginRoutes(page, origin);
     for (const link of links) {
       const key = stripHash(link);
-      if (!seenRoutes.has(key) && !queuedRoutes.some((item) => stripHash(item.url) === key)) {
+      if (
+        !seenRoutes.has(key) &&
+        !queuedRoutes.some((item) => stripHash(item.url) === key)
+      ) {
         queuedRoutes.push({ url: link, depth: current.depth + 1 });
       }
     }
@@ -175,6 +225,7 @@ console.log(`Output: ${outRoot}`);
 
 async function launchBrowser() {
   const launchOptions = { headless: !args.headful };
+  if (proxyServer) launchOptions.proxy = { server: proxyServer };
 
   try {
     return await chromium.launch(launchOptions);
@@ -198,9 +249,28 @@ async function launchBrowser() {
 
 function parseArgs(argv) {
   const parsed = {};
-  for (let i = 0; i < argv.length; i += 1) {
-    const token = argv[i];
-    if (!token.startsWith("--") && !parsed.url) {
+  const tokens = argv.map((token) => {
+    const letter = /^-([A-Za-z])$/.exec(token)?.[1];
+    return letter && SHORT_FLAGS[letter] ? `--${SHORT_FLAGS[letter]}` : token;
+  });
+
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i];
+    if (token === "--help") {
+      parsed.help = true;
+      continue;
+    }
+    if (token === "--proxy") {
+      parsed.proxy = tokens[i + 1];
+      i += 1;
+      continue;
+    }
+    if (token === "--header") {
+      (parsed.header ??= []).push(tokens[i + 1]);
+      i += 1;
+      continue;
+    }
+    if (!token.startsWith("-") && !parsed.url) {
       parsed.url = token;
       continue;
     }
@@ -225,11 +295,24 @@ function parseArgs(argv) {
     }
     if (token.startsWith("--")) {
       const key = token.slice(2);
-      parsed[key] = argv[i + 1];
+      parsed[key] = tokens[i + 1];
       i += 1;
     }
   }
   return parsed;
+}
+
+function parseHeaders(values) {
+  if (!values?.length) return null;
+  const headers = {};
+  for (const value of values) {
+    const separatorIndex = value.indexOf(":");
+    if (separatorIndex === -1) continue;
+    headers[value.slice(0, separatorIndex).trim()] = value
+      .slice(separatorIndex + 1)
+      .trim();
+  }
+  return Object.keys(headers).length ? headers : null;
 }
 
 function normalizeUrl(value) {
@@ -245,25 +328,36 @@ function stripHash(value) {
 
 function looksLikeJavaScriptUrl(value) {
   const pathname = new URL(value).pathname.toLowerCase();
-  if (/\.(css|map|json|png|jpe?g|gif|webp|svg|ico|woff2?|ttf|eot)$/i.test(pathname)) {
+  if (
+    /\.(css|map|json|png|jpe?g|gif|webp|svg|ico|woff2?|ttf|eot)$/i.test(
+      pathname,
+    )
+  ) {
     return false;
   }
   return /\.(js|mjs|cjs)$/i.test(pathname);
 }
 
 function looksLikeJavaScriptContentType(value) {
-  return /javascript|ecmascript|text\/js|application\/x-javascript/i.test(value);
+  return /javascript|ecmascript|text\/js|application\/x-javascript/i.test(
+    value,
+  );
 }
 
 async function gotoAndSettle(targetPage, url) {
   try {
-    await targetPage.goto(url, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+    await targetPage.goto(url, {
+      waitUntil: "domcontentloaded",
+      timeout: timeoutMs,
+    });
   } catch (error) {
     console.warn(`  navigation warning: ${error.message}`);
   }
 
   try {
-    await targetPage.waitForLoadState("networkidle", { timeout: Math.min(timeoutMs, 10000) });
+    await targetPage.waitForLoadState("networkidle", {
+      timeout: Math.min(timeoutMs, 10000),
+    });
   } catch {
     // Many SPAs keep long-lived requests open. A fixed wait below still catches late chunks.
   }
@@ -283,11 +377,14 @@ async function discoverScriptUrls(targetPage) {
 
     document.querySelectorAll("script[src]").forEach((node) => add(node.src));
     document
-      .querySelectorAll('link[href][rel~="modulepreload"], link[href][rel~="preload"], link[href][rel~="prefetch"]')
+      .querySelectorAll(
+        'link[href][rel~="modulepreload"], link[href][rel~="preload"], link[href][rel~="prefetch"]',
+      )
       .forEach((node) => {
         const asValue = (node.getAttribute("as") ?? "").toLowerCase();
         const href = node.getAttribute("href") ?? "";
-        if (asValue === "script" || /\.(js|mjs|cjs)(?:$|\?)/i.test(href)) add(node.href);
+        if (asValue === "script" || /\.(js|mjs|cjs)(?:$|\?)/i.test(href))
+          add(node.href);
       });
 
     performance.getEntriesByType("resource").forEach((entry) => {
@@ -303,7 +400,8 @@ async function discoverScriptUrls(targetPage) {
 async function discoverSameOriginRoutes(targetPage, expectedOrigin) {
   const routes = await targetPage.evaluate((originValue) => {
     const ignoredSchemes = /^(mailto|tel|sms|javascript):/i;
-    const ignoredExt = /\.(zip|rar|7z|tar|gz|pdf|png|jpe?g|gif|webp|svg|ico|css|js|map|json|xml|txt|mp4|mp3|webm|mov)$/i;
+    const ignoredExt =
+      /\.(zip|rar|7z|tar|gz|pdf|png|jpe?g|gif|webp|svg|ico|css|js|map|json|xml|txt|mp4|mp3|webm|mov)$/i;
     const found = new Set();
 
     document.querySelectorAll("a[href]").forEach((anchor) => {
@@ -382,7 +480,8 @@ async function discoverAndDownloadLazyChunks(activeContext) {
     round += 1;
     const candidates = new Set();
     const jsFiles = [...downloaded.values()].filter(
-      (item) => item.source !== "sourcemap" && /\.(js|mjs|cjs)$/i.test(item.localPath),
+      (item) =>
+        item.source !== "sourcemap" && /\.(js|mjs|cjs)$/i.test(item.localPath),
     );
 
     for (const file of jsFiles) {
@@ -394,13 +493,18 @@ async function discoverAndDownloadLazyChunks(activeContext) {
       }
     }
 
-    const toDownload = [...candidates].slice(0, maxLazyChunks - totalLazyDownloads);
+    const toDownload = [...candidates].slice(
+      0,
+      maxLazyChunks - totalLazyDownloads,
+    );
     if (!toDownload.length) {
       if (round === 1) console.log("Lazy chunk scan found 0 new JS URL(s).");
       break;
     }
 
-    console.log(`Lazy chunk scan round ${round}: found ${toDownload.length} new JS URL(s).`);
+    console.log(
+      `Lazy chunk scan round ${round}: found ${toDownload.length} new JS URL(s).`,
+    );
     let roundDownloads = 0;
 
     for (const url of toDownload) {
@@ -418,7 +522,9 @@ async function discoverAndDownloadLazyChunks(activeContext) {
   }
 
   if (totalLazyDownloads >= maxLazyChunks) {
-    console.warn(`  lazy warning: stopped at --max-lazy-chunks=${maxLazyChunks}`);
+    console.warn(
+      `  lazy warning: stopped at --max-lazy-chunks=${maxLazyChunks}`,
+    );
   }
 }
 
@@ -478,7 +584,9 @@ function extractWebpackChunkMapPaths(source) {
   for (const match of source.matchAll(blockBeforeJs)) {
     const blockStart = Math.max(0, match.index - 250);
     const prefixSource = source.slice(blockStart, match.index);
-    const prefixMatch = prefixSource.match(/["']([^"']*static\/chunks\/)["']\s*\+\s*[A-Za-z_$][\w$]*\s*\+\s*["']\.["']\s*\+\s*$/);
+    const prefixMatch = prefixSource.match(
+      /["']([^"']*static\/chunks\/)["']\s*\+\s*[A-Za-z_$][\w$]*\s*\+\s*["']\.["']\s*\+\s*$/,
+    );
     if (!prefixMatch) continue;
 
     const prefix = prefixMatch[1];
@@ -498,7 +606,11 @@ function parseWebpackObjectMap(block) {
   for (const match of block.matchAll(entryPattern)) {
     const rawKey = match[1] ?? match[2] ?? match[3];
     const value = match[4];
-    if (!rawKey || !/^[A-Za-z0-9_$]+$/.test(rawKey) || !/^[A-Za-z0-9._-]+$/.test(value)) {
+    if (
+      !rawKey ||
+      !/^[A-Za-z0-9_$]+$/.test(rawKey) ||
+      !/^[A-Za-z0-9._-]+$/.test(value)
+    ) {
       continue;
     }
 
@@ -533,7 +645,10 @@ function resolveAssetUrls(assetPath, fileUrl, source) {
     return [...urls];
   }
 
-  if (value.startsWith("static/") && sourceUrl.pathname.includes("/_next/static/")) {
+  if (
+    value.startsWith("static/") &&
+    sourceUrl.pathname.includes("/_next/static/")
+  ) {
     urls.add(`${sourceUrl.origin}/_next/${value}`);
     for (const base of inferExplicitPublicPathBases(sourceUrl, source)) {
       try {
@@ -555,7 +670,9 @@ function resolveAssetUrls(assetPath, fileUrl, source) {
 function inferExplicitPublicPathBases(sourceUrl, source) {
   const bases = new Set();
 
-  for (const match of source.matchAll(/(?:\.p|publicPath)\s*=\s*["']([^"']+)["']/g)) {
+  for (const match of source.matchAll(
+    /(?:\.p|publicPath)\s*=\s*["']([^"']+)["']/g,
+  )) {
     const publicPath = match[1];
     if (!publicPath || publicPath === "auto") continue;
     try {
@@ -577,7 +694,9 @@ function inferAssetBases(fileUrl, source) {
 
   const nextStaticIndex = url.pathname.indexOf("/_next/static/");
   if (nextStaticIndex !== -1) {
-    bases.add(`${url.origin}${url.pathname.slice(0, nextStaticIndex + "/_next/".length)}`);
+    bases.add(
+      `${url.origin}${url.pathname.slice(0, nextStaticIndex + "/_next/".length)}`,
+    );
   }
 
   for (const base of inferExplicitPublicPathBases(url, source)) {
@@ -589,7 +708,9 @@ function inferAssetBases(fileUrl, source) {
 }
 
 async function downloadSourcemaps(activeContext) {
-  const jsFiles = [...downloaded.values()].filter((item) => item.localPath.endsWith(".js"));
+  const jsFiles = [...downloaded.values()].filter((item) =>
+    item.localPath.endsWith(".js"),
+  );
 
   for (const file of jsFiles) {
     const data = await fs.readFile(file.localPath, "utf8").catch(() => "");
@@ -602,7 +723,12 @@ async function downloadSourcemaps(activeContext) {
       if (!inlineMap) continue;
 
       const mapUrl = `${file.url}.inline.map`;
-      await saveBuffer(mapUrl, Buffer.from(inlineMap), "application/json", "sourcemap");
+      await saveBuffer(
+        mapUrl,
+        Buffer.from(inlineMap),
+        "application/json",
+        "sourcemap",
+      );
       continue;
     }
 
@@ -612,7 +738,9 @@ async function downloadSourcemaps(activeContext) {
 }
 
 async function recoverOriginalSources(activeContext) {
-  const mapFiles = [...downloaded.values()].filter((item) => item.source === "sourcemap");
+  const mapFiles = [...downloaded.values()].filter(
+    (item) => item.source === "sourcemap",
+  );
   let recovered = 0;
 
   for (const mapFile of mapFiles) {
@@ -628,21 +756,37 @@ async function recoverOriginalSources(activeContext) {
     }
 
     const sources = Array.isArray(sourcemap.sources) ? sourcemap.sources : [];
-    const sourcesContent = Array.isArray(sourcemap.sourcesContent) ? sourcemap.sourcesContent : [];
-    const sourceRoot = typeof sourcemap.sourceRoot === "string" ? sourcemap.sourceRoot : "";
+    const sourcesContent = Array.isArray(sourcemap.sourcesContent)
+      ? sourcemap.sourcesContent
+      : [];
+    const sourceRoot =
+      typeof sourcemap.sourceRoot === "string" ? sourcemap.sourceRoot : "";
     const mapBaseUrl = mapFile.url.replace(/\.inline\.map$/, "");
 
     for (let i = 0; i < sources.length; i += 1) {
       const sourceName = sources[i];
-      if (!sourceName || /^webpack:\/{3}ignored|^webpack:\/\/\/\(\./.test(sourceName)) continue;
+      if (
+        !sourceName ||
+        /^webpack:\/{3}ignored|^webpack:\/\/\/\(\./.test(sourceName)
+      )
+        continue;
 
       let sourceCode = sourcesContent[i];
       if (typeof sourceCode !== "string") {
-        sourceCode = await fetchMappedSource(activeContext, mapBaseUrl, sourceRoot, sourceName);
+        sourceCode = await fetchMappedSource(
+          activeContext,
+          mapBaseUrl,
+          sourceRoot,
+          sourceName,
+        );
       }
       if (typeof sourceCode !== "string") continue;
 
-      const sourcePath = originalSourcePath(mapFile.url, sourceRoot, sourceName);
+      const sourcePath = originalSourcePath(
+        mapFile.url,
+        sourceRoot,
+        sourceName,
+      );
       await fs.mkdir(path.dirname(sourcePath), { recursive: true });
       await fs.writeFile(sourcePath, sourceCode, "utf8");
       recovered += 1;
@@ -652,7 +796,12 @@ async function recoverOriginalSources(activeContext) {
   console.log(`Recovered ${recovered} source-map source file(s).`);
 }
 
-async function fetchMappedSource(activeContext, mapBaseUrl, sourceRoot, sourceName) {
+async function fetchMappedSource(
+  activeContext,
+  mapBaseUrl,
+  sourceRoot,
+  sourceName,
+) {
   if (/^(webpack|ng|vite|rollup|parcel):/i.test(sourceName)) return null;
 
   const candidates = [];
@@ -676,7 +825,9 @@ async function fetchMappedSource(activeContext, mapBaseUrl, sourceRoot, sourceNa
 }
 
 function decodeInlineSourcemap(value) {
-  const match = value.match(/^data:application\/json(?:;charset=[^;,]+)?(;base64)?,(.*)$/i);
+  const match = value.match(
+    /^data:application\/json(?:;charset=[^;,]+)?(;base64)?,(.*)$/i,
+  );
   if (!match) return null;
 
   try {
@@ -689,7 +840,9 @@ function decodeInlineSourcemap(value) {
 }
 
 function originalSourcePath(mapUrl, sourceRoot, sourceName) {
-  const mapHost = sanitizePathSegment(new URL(mapUrl.replace(/\.inline\.map$/, "")).host);
+  const mapHost = sanitizePathSegment(
+    new URL(mapUrl.replace(/\.inline\.map$/, "")).host,
+  );
   const cleanRoot = normalizeVirtualSourcePart(sourceRoot);
   const cleanSource = normalizeVirtualSourcePart(sourceName);
   const parts = [outRoot, "__sources", mapHost, ...cleanRoot, ...cleanSource];
@@ -710,10 +863,13 @@ function normalizeVirtualSourcePart(value) {
 
 async function writePrettifiedFiles() {
   const jsFiles = [...downloaded.values()].filter(
-    (item) => item.source !== "sourcemap" && /\.(js|mjs|cjs)$/i.test(item.localPath),
+    (item) =>
+      item.source !== "sourcemap" && /\.(js|mjs|cjs)$/i.test(item.localPath),
   );
   const prettier =
-    prettyEngine === "basic" || prettyEngine === "fast" ? null : await loadPrettier();
+    prettyEngine === "basic" || prettyEngine === "fast"
+      ? null
+      : await loadPrettier();
   let formattedCount = 0;
   let basicCount = 0;
   let prettierCount = 0;
@@ -739,7 +895,11 @@ async function writePrettifiedFiles() {
     const formatted = usePrettier
       ? await formatWithPrettier(prettier, source, file.localPath)
       : basicJavaScriptPrettify(source);
-    const prettyPath = path.join(outRoot, "__pretty", path.relative(outRoot, file.localPath));
+    const prettyPath = path.join(
+      outRoot,
+      "__pretty",
+      path.relative(outRoot, file.localPath),
+    );
 
     await fs.mkdir(path.dirname(prettyPath), { recursive: true });
     await fs.writeFile(prettyPath, formatted, "utf8");
@@ -749,7 +909,9 @@ async function writePrettifiedFiles() {
   }
 
   if (!prettier && prettyEngine !== "basic" && prettyEngine !== "fast") {
-    console.warn("  pretty warning: install prettier for higher-quality small-file formatting: npm install prettier");
+    console.warn(
+      "  pretty warning: install prettier for higher-quality small-file formatting: npm install prettier",
+    );
   }
   console.log(
     `Prettified ${formattedCount} JS file(s): ${prettierCount} with Prettier, ${basicCount} with basic formatter.`,
@@ -853,7 +1015,7 @@ function basicJavaScriptPrettify(source) {
       continue;
     }
 
-    if (char === "\"" || char === "'" || char === "`") {
+    if (char === '"' || char === "'" || char === "`") {
       quote = char;
       writeToken(char);
       continue;
@@ -870,7 +1032,13 @@ function basicJavaScriptPrettify(source) {
       if (!lineStart) writeNewline();
       indent -= 1;
       writeToken(char);
-      if (next !== ";" && next !== "," && next !== "." && next !== ")" && next !== "]") {
+      if (
+        next !== ";" &&
+        next !== "," &&
+        next !== "." &&
+        next !== ")" &&
+        next !== "]"
+      ) {
         writeNewline();
       }
       continue;
@@ -962,7 +1130,11 @@ function localFileNameForUrl(value) {
   if (!path.extname(file)) file += ".js";
 
   if (url.search) {
-    const hash = crypto.createHash("sha1").update(url.search).digest("hex").slice(0, 10);
+    const hash = crypto
+      .createHash("sha1")
+      .update(url.search)
+      .digest("hex")
+      .slice(0, 10);
     const ext = path.extname(file);
     file = `${path.basename(file, ext)}.${hash}${ext}`;
   }
